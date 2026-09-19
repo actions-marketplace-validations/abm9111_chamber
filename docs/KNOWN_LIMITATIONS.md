@@ -156,6 +156,33 @@ of code.
 
 ## 5. The corpus has no notion of deletion
 
+> **Correction, 2026-09-13.** The central objection below — that deletion is
+> unsafe because "a file absent from the walk is indistinguishable from one an
+> `--exclude` pattern pruned" — is true of walk attendance and false of
+> existence: an excluded file is still on disk. `findGoneDocuments`
+> (`src/pins.ts`) therefore keys on `existsSync` and covers the whole corpus,
+> not just the pinned slice; `chamber verify` reports the count, and
+> `chamber prune` removes them (dry run by default, `--confirm` to act).
+>
+> Two guards make that safe, and both are pinned by tests. An ingest root that
+> does not resolve to a directory is skipped whole, because an unmounted
+> volume makes every file under it look deleted and a per-file sweep would
+> delete the corpus on the first mount failure — unreachable is unknown, never
+> empty. And a passage a belief still cites is never pruned: its file is gone,
+> so the stored body is the last copy of that evidence, and `verify` already
+> reports it. Prune also names unreadable roots rather than reporting "nothing
+> to prune", since those are opposite states that otherwise print the same
+> sentence.
+>
+> What still stands: **renames still duplicate.** Identity is
+> `(root, relative path)`, so a renamed file is ingested fresh while the old
+> path's rows survive — `prune` now removes the old copy once the rename means
+> its path no longer exists, but nothing recognises the two as the same note,
+> so a pin on the old path does not follow the rename. The original text stays
+> below, dated.
+
+
+
 Re-ingesting a directory does delete, and the boundary is worth stating precisely,
 because an earlier revision of this entry said flatly that it never removes rows. For a
 file it actually walked and read, the shrink sweep (`src/ingest.ts:758-775`) removes the
@@ -390,9 +417,37 @@ Worth noting that the repository's *other* FTS5 table does set a tokenizer expli
 (`sql/schema_hermes_parity.sql:44-50`), so this is an omission rather than a considered
 default.
 
-**What would fix it.** A tokenizer that segments CJK — the `trigram` tokenizer that ships
-with SQLite is the zero-dependency option and handles CJK acceptably; a proper segmenter
-would be better and would cost a dependency Chamber does not currently have. Unplanned.
+**Measured, 2026-09-13**, against a real 43,541-passage corpus, comparing FTS5
+`MATCH` recall to ground truth (`body LIKE`) for one probe term per script:
+
+| probe   | passages containing it | FTS matches | recall |
+|---------|-----------------------:|------------:|-------:|
+| English |                     56 |          53 |    95% |
+| Arabic  |                     13 |          13 |   100% |
+| CJK     |                     80 |           6 |   7.5% |
+
+Two corrections to the text above. It is not "no results, consistently" — a CJK
+run matches when a query happens to reproduce a whole token exactly, which is
+7.5% of the time here rather than 0%. And the entry's silence about other
+non-Latin scripts reads as though they share the problem: **Arabic does not**.
+`unicode61` splits on Unicode category boundaries, and Arabic is
+space-separated, so its words tokenize normally — full recall on this corpus,
+which holds more Arabic (1,786 passages, 4.10%) than CJK (1,236, 2.84%).
+
+**What would fix it, and why it is not being done.** A tokenizer that segments
+CJK — SQLite's `trigram` is the zero-dependency option; a proper segmenter
+would cost a dependency Chamber does not have.
+
+The reason to leave it: the tokenizer is a property of the FTS table, so
+changing it rebuilds the index for the *entire* corpus and changes matching
+semantics for every language in it, to raise recall on 2.84% of passages that
+are — in this corpus — scraped third-party Chinese pages (`grizzlysms.com/cn`,
+`zh-CN` product docs) rather than operator-authored notes. Trigram also matches
+substrings, which changes Latin ranking as a side effect.
+
+That calculus is corpus-dependent, not permanent: a corpus whose CJK is
+first-class content should make the swap, and the measurement above is the way
+to decide rather than guess. Unplanned, deliberately.
 
 ## 12. Retrieval quality has no corpus-level regression guard
 
@@ -489,48 +544,94 @@ or a model call inside the gate. A belief-kind citation that consulted
 belief — closes the second half with a SELECT the gate already nearly performs.
 Unplanned.
 
-## 15. The embedder can silently downgrade, and runs one subprocess per passage
+## 15. The embedder truncates at 256 tokens, and the chunker overshoots it
 
-`embedMinilm` shells out to `python3` with `scripts/embed_minilm.py`. Two things
-follow from that, and the first one destroyed a real corpus.
+`embedMinilm` shells out to `python3` with `scripts/embed_minilm.py`. Most of
+what this entry used to describe has been closed; what follows separates the
+two.
 
-**It can fail without saying so.** `minilmAvailable()` (`src/embedder.ts:56`)
-tests that two *files* exist. It does not test that the embedder *runs*. So on a
-machine where the resolved `python3` lacks `numpy` or `onnxruntime`, availability
-reports true, `embedMinilm` throws, and `embedLocal(_, "auto")` falls back to a
-256-dimension hash vector. A hash vector is a valid vector, so nothing
-downstream can tell.
+**Closed: the availability check answered the wrong question.**
+`minilmAvailable()` tested that two *files* exist. Both ship in the repo, so it
+returned true on every checkout — including on the machine whose resolved
+`python3` had neither numpy nor onnxruntime. `embedMinilm` threw, `embedLocal`
+caught, a 256-dimension hash vector went in where a 384-dimension semantic one
+belonged, and nothing downstream could tell: a hash vector is a valid vector.
+The 08:30 job re-embedded 28,508 passages that way every morning and exited 0,
+and `chamber ask` answered *"nothing in the corpus matches this question"* for
+material sitting in the index.
 
-Observed on the development machine on 2026-08-05, not reasoned about: an
-interactive shell resolved `python3` to an interpreter with the dependencies,
-while a **login** shell — which is what `launchd` and `systemd` units run —
-resolved it to `/usr/bin/python3`, which has neither. The scheduled 08:30 job
-therefore re-embedded all 28,508 passages with `local-hash-v1` every morning and
-exited 0. `chamber ask` answered *"nothing in the corpus matches this question"*
-for material sitting in the index, because the query was a 384-dimension MiniLM
-vector and every stored vector was a 256-dimension hash.
+It now runs the embedder on a fixed input and requires a 384-dimension vector
+back, cached per interpreter path. `minilmInstalled()` keeps the files
+question, because the two callers need different answers: an install with no
+model files should quietly use hash vectors, while an install whose interpreter
+cannot run the model must throw for anyone who passed `prefer: "minilm"`.
 
-**What it costs.** Every other signal reported health. `verify` exited 0, the
-passage count was correct, and content pins verified — pins hash the stored
-*body*, not the vector, so the citation gate cannot see this. The only visible
-symptom was ingest finishing in two minutes instead of seventy-five, and nothing
-watches for a check being suspiciously fast.
+**Closed: the downgrade is audible, and a mismatched corpus says so.** The
+fallback warns once per process naming the underlying error; `CHAMBER_PYTHON`
+names the interpreter explicitly, because PATH is the thing that differs
+between an interactive and a login shell; and `chamber ask` compares the
+query's model against the corpus's dominant model and says so in its note
+channel rather than returning an empty result with no cause.
 
-**Mitigated, not fixed.** The fallback now prints one warning per process naming
-the underlying error, and `CHAMBER_PYTHON` names the interpreter explicitly —
-PATH is the thing that differs between shells, so a PATH-dependent setting
-cannot resolve it. What remains unfixed is the shape of the check:
-`minilmAvailable()` still answers a question about files rather than about
-execution, which is the same defect `engines/preflight.md` calls "a probe that
-cannot fail". Nothing records, per corpus, which embedder produced it, so a
-database cannot report that its vectors and its queries disagree.
+**Closed: one subprocess per passage.** `embedLocalBatch` is wired into
+`src/ingest.ts`, which was the path that took 75 minutes for 28,500 passages.
+`upsertDocument` still embeds singly for callers that hand it a body rather
+than a vector, which is correct for one-off writes and for query embedding.
 
-**And it is slow.** `upsertDocument` calls `embedLocal` once per passage — a
-fresh python startup and ONNX model load each time, measured at ~158 ms. A
-28,500-passage corpus takes about 75 minutes. `embedLocalBatch`
-(`src/embedder.ts:304`) exists to amortise exactly this and **has no callers**.
-Wiring it in is the single largest performance win available in the ingest path.
-Unplanned.
+**Open: 1.24% of passages lose their tail, and the chunker is why.** 256 tokens
+is all-MiniLM-L6-v2's own trained `max_seq_length`, so truncating there is
+correct — raising it would exceed what the model was trained for. Doing it
+silently was not: a half-embedded passage produces a valid vector, verifies
+(pins hash the stored body, not the vector), and counts toward the passage
+total. The only symptom is a query that cannot find text the corpus visibly
+contains, which reads as bad retrieval rather than as content that was never
+indexed.
+
+`chamber ingest` now reports it — passage count, tokens dropped, longest input
+— on stderr, where a scheduled run greps for surprises.
+
+Measured over a real 43,541-passage corpus on 2026-09-13: **541 passages
+(1.24%) exceeded the limit and 80,989 tokens were dropped**, the worst single
+passage losing 370 of its 626. Narrow, and it was invisible until counted.
+
+**Mostly closed, 2026-09-13: the estimator, not the cap, was wrong.** The
+chunker does bound every passage — at 220 *estimated* tokens, with deliberate
+margin under 256. The estimate was the defect: `ceil(len/6)` per alphanumeric
+run undershot the real wordpiece count on 47.7% of that corpus, so 541
+passages sat under the cap while exceeding the window. One content shape
+explains it — long runs containing a digit (base64, hashes, API tokens, UUIDs)
+split near one token per 1.5 characters, and an 800-character blob charged 134
+tokens cost 573. Non-ASCII was not implicated: of 2,628 passages over 20%
+non-ASCII, zero exceeded the limit.
+
+Opaque runs are now charged accordingly. Measured by re-chunking the 154
+affected files and counting real wordpieces: passages over the window fell
+from 540 to 113, and **tokens silently dropped fell from 80,970 to 2,846** —
+96.5% of the lost text recovered.
+
+The narrowness of the predicate is the interesting part. A first version
+treated anything not purely lowercase/Capitalised as opaque, which swept in
+every CamelCase product name (`OpenClaw`, `TestFlight`) and removed the last
+breaches at the cost of re-chunking 54.8% of files and 73.7% of all passages.
+Boundary churn is cumulative — shifting one unit's estimate moves every
+packing boundary after it — so a 2% change in estimated size is not a 2%
+change in the corpus. The shipped predicate touches 154 files instead, and
+before accepting even that: of the 47 pins in the corpus that resolve to a
+passage, zero are in a file that re-chunks, so no belief loses its evidence.
+
+**Still open.** 113 passages (0.34%) overshoot by small margins, and they are
+mostly single unsplittable opaque runs where the oversized-unit path bounds by
+characters rather than wordpieces. No estimator closes that; only splitting on
+a real tokenizer would, and that would make chunk boundaries depend on whether
+python is installed — different machines chunking the same note differently,
+which is a worse defect than a truncated tail. A corpus ingested before this
+change keeps its old boundaries until re-ingested.
+
+Also note: `models/minilm/tokenizer.json` declares `truncation.max_length:
+128`. The script overrides it to 256 explicitly, so the model's full length is
+used — but any *other* consumer of that tokenizer file gets 128 silently. A
+measurement script written against it reported "0 passages over 256" for this
+corpus, which was the instrument capping, not the data.
 
 ## The paraphrase gate softens when its embedder is unavailable — deliberately
 
@@ -735,3 +836,40 @@ disclosure each surface phrases for itself is one a surface eventually drops.
 on the stub, deliberately, because `chamber try` and the demos depend on an
 offline deterministic path. A reader who ignores five lines of capitals gets
 the old behaviour back.
+
+## 20. The runtime image ships 56 HIGH/CRITICAL CVEs with no fix available
+
+Nothing scanned the image until 2026-09-13. `npm audit` and Dependabot read
+`package.json`, and runtime dependencies here are deliberately empty — so both
+reported a clean project while `node:24-bookworm-slim` carried **62 HIGH or
+CRITICAL CVEs**. A dependency gate that cannot see the operating system is not
+an image gate, and the absence of findings was the absence of a scanner.
+
+**Fixed, in part.** `deploy/Dockerfile` now applies the base's security
+updates and deletes npm, npx and corepack — never used at runtime, and the
+carrier of three of the six fixable HIGHs (its bundled `tar`,
+`brace-expansion` and `ip-address`). That took the fixable count from 6 to 0,
+measured. CI's `image` job builds the Dockerfile and fails on any HIGH or
+CRITICAL **that has a fix available**.
+
+**What remains, and it is the larger number.** 56 HIGH/CRITICAL have no
+upstream fix — 52 HIGH and 4 CRITICAL, one of which (zlib) upstream has marked
+`will_not_fix`. The `image` job passes `--ignore-unfixed`, so none of them
+blocks a build.
+
+That is a deliberate tradeoff, and the honest way to read the green badge is:
+*no CVE with an available fix is present*, not *the image is free of critical
+vulnerabilities*. The alternative — failing on the unfixable set — makes the
+job red on the day it is added and red every day after, which is the failure
+this project keeps fixing elsewhere: an alarm that always fires is one its
+reader learns to wave through. The full set, unfixable included, is printed to
+the job summary on every run so the number stays visible rather than becoming
+folklore.
+
+**What would actually close it:** a smaller base. Most of the 56 are in
+Debian packages this image never executes. `node:24-alpine` or a distroless
+base would remove them by removing the surface, which is the same choice the
+npm deletion made. Not done here because the embedder path's Python
+dependencies (`scripts/embed_minilm.py`, numpy/onnxruntime) are not yet proven
+on musl, and shipping an image whose semantic gate silently degrades to hash
+vectors would trade a scanner number for a correctness regression.

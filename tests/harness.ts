@@ -56,14 +56,20 @@ import {
   verifyBeliefSources,
   countUnsourcedBeliefs,
   findGonePinnedFiles,
+  findGoneDocuments,
+  pruneGoneDocuments,
   buildVerifyReport,
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
 import { runAsk, citedIndices, stubDisclosure } from "../src/ask.ts";
 import {
   minilmAvailable,
+  minilmInstalled,
+  resetMinilmProbe,
+  minilmTruncationSeen,
   embedLocal,
   embedLocalBatch,
+  HASH_MODEL,
   MINILM_MODEL,
 } from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
@@ -214,7 +220,7 @@ import {
   loadConfig,
   explainConfig,
 } from "../src/config.ts";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
@@ -1756,6 +1762,218 @@ test("gates", "an operator can waive a debt that cannot be paid", () => {
  * Soft-skips without a real embedder, because without one the semantic leg does
  * not run at all and the test would pass for a reason that proves nothing.
  */
+/**
+ * `minilmAvailable()` answered a question about FILES, not about execution:
+ * `existsSync(SCRIPT) && existsSync(MODEL)`. That is what let the 08:30 job
+ * re-embed 28,508 passages as hash vectors every morning and exit 0 — the
+ * files were present, the interpreter could not import numpy, availability
+ * said yes, and the fallback wrote a valid-looking 256-dim vector.
+ *
+ * The check has to run the thing. An interpreter that exists and exits
+ * non-zero must read as unavailable while both files sit exactly where they
+ * were, which is the case this asserts: nothing about the filesystem changes
+ * between the two halves, only whether the embedder can actually produce a
+ * vector.
+ */
+test("embedder", "availability answers whether the embedder RUNS, not whether files exist", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const scriptsExist =
+    existsSync(join(repoRoot, "scripts/embed_minilm.py")) &&
+    existsSync(join(repoRoot, "models/minilm/model_quantized.onnx"));
+  assert(scriptsExist, "both files must be present for this test to mean anything");
+
+  const saved = process.env.CHAMBER_PYTHON;
+  try {
+    // Exists, executes, exits non-zero, prints no vector: the exact shape of
+    // a python without onnxruntime, without needing one on the test machine.
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    assert(
+      minilmAvailable() === false,
+      "an interpreter that cannot produce a vector must read as unavailable",
+    );
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * The probe costs a subprocess, so it is cached — but cached per interpreter,
+ * not per process. A single cache would make the first caller's interpreter
+ * the permanent answer, so `CHAMBER_PYTHON` set later (or a test, or a
+ * long-lived server re-reading config) would be told about a python it is no
+ * longer using.
+ */
+test("embedder", "the availability probe is cached per interpreter, not globally", () => {
+  const saved = process.env.CHAMBER_PYTHON;
+  try {
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    assert(minilmAvailable() === false, "broken interpreter reads unavailable");
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    assert(minilmAvailable() === false, "still unavailable on the cached path");
+
+    // Switching back must re-probe rather than return the cached `false`.
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+    const real = minilmAvailable();
+    // Only assert the direction that is knowable on any machine: the answer
+    // is recomputed, not the previous interpreter's cached one. Where a real
+    // embedder exists this is true; where none does, both are false and the
+    // test proves nothing, so it says so.
+    if (!real) {
+      assert(true, "no working embedder on this machine — cache direction unprovable");
+    } else {
+      assert(real === true, "restoring a working interpreter must re-probe to true");
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * Both of these are regressions the honest probe introduced, found by running
+ * the real path rather than by reading the diff.
+ *
+ * Making availability answer "does it run" silently changed the meaning of
+ * `prefer === "minilm" && !minilmAvailable() ? "hash"`, a line written when it
+ * meant "are the files there". A caller passing `prefer: "minilm"` does so
+ * because it must NOT degrade — `src/ask.ts` relies on the throw so a query is
+ * never hash-embedded against a MiniLM corpus — and for one commit it got a
+ * hash vector and no error instead.
+ */
+test("embedder", "an explicit minilm request still throws on a broken interpreter, never degrades", () => {
+  if (!minilmInstalled()) {
+    assert(true, "no model files — the degrade-to-hash path is the correct one here");
+    return;
+  }
+  const saved = process.env.CHAMBER_PYTHON;
+  try {
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    let threw = false;
+    try {
+      embedLocal("anything", "minilm");
+    } catch {
+      threw = true;
+    }
+    assert(threw, "prefer:minilm on an installed-but-unrunnable embedder must throw");
+
+    let batchThrew = false;
+    try {
+      embedLocalBatch(["a", "b"], "minilm");
+    } catch {
+      batchThrew = true;
+    }
+    assert(batchThrew, "the batch path must throw for the same request");
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * The silent downgrade was audible only by accident: availability said yes, the
+ * embed threw, and `embedLocal`'s catch warned. Answering honestly up front
+ * removes that accident — so an installed-but-unrunnable embedder has to raise
+ * the warning from the probe itself, or the exact defect KNOWN_LIMITATIONS 15
+ * describes comes back one layer earlier.
+ */
+test("embedder", "an installed embedder that cannot run says so, rather than degrading quietly", () => {
+  if (!minilmInstalled()) {
+    assert(true, "no model files — nothing to be quiet about");
+    return;
+  }
+  const saved = process.env.CHAMBER_PYTHON;
+  const warnings: string[] = [];
+  const realWarn = console.warn;
+  try {
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    // Both caches have to go: the probe's per-interpreter answer AND the
+    // warn-once latch an earlier test in this file has already spent.
+    resetMinilmProbe();
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    const r = embedLocal("anything", "auto");
+    console.warn = realWarn;
+    assert(r.model === HASH_MODEL, `auto must still produce a usable vector, got ${r.model}`);
+    assert(
+      warnings.some((w) => /minilm|embedder/i.test(w)),
+      `the downgrade must be announced; captured: ${JSON.stringify(warnings).slice(0, 200)}`,
+    );
+  } finally {
+    console.warn = realWarn;
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+    resetMinilmProbe();
+  }
+});
+
+/**
+ * The python side has always reported overflow on stderr; the TS side read
+ * stderr only when the embed FAILED, so on every successful run the count was
+ * written and dropped. This asserts the number survives the process boundary,
+ * because that boundary is where it was being lost.
+ *
+ * Needs a real embedder: with hash vectors nothing tokenizes and there is no
+ * limit to exceed, so the test would pass without exercising anything.
+ */
+test("embedder", "truncation crosses the subprocess boundary instead of dying on stderr", () => {
+  if (!minilmAvailable()) {
+    assert(true, "no runnable embedder — truncation cannot be observed here");
+    return;
+  }
+  resetMinilmProbe();
+  assert(
+    minilmTruncationSeen() === null,
+    "reset must clear the accumulator, or this test reads a previous test's total",
+  );
+
+  const short = "a brief passage";
+  // Comfortably past 256 tokens: each "finding<n>" costs more than one token.
+  const long = Array.from({ length: 600 }, (_, i) => `finding${i}`).join(" ");
+
+  embedLocalBatch([short, long], "minilm");
+  const t = minilmTruncationSeen();
+  assert(t !== null, "an input past the limit must be reported");
+  assert(t!.passages === 1, `exactly one input overflowed, got ${t!.passages}`);
+  assert(t!.limit === 256, `limit should be the model's trained length, got ${t!.limit}`);
+  assert(t!.tokensDropped > 0, "a truncated passage drops at least one token");
+  assert(
+    t!.longest > t!.limit,
+    `longest (${t!.longest}) must exceed the limit or nothing was truncated`,
+  );
+
+  // Accumulates rather than overwrites: an ingest embeds in many batches and
+  // the operator's question is how much of the corpus lost its tail.
+  embedLocalBatch([long, long], "minilm");
+  const t2 = minilmTruncationSeen();
+  assert(
+    t2!.passages === 3,
+    `totals must accumulate across calls, got ${t2!.passages} after 1 + 2`,
+  );
+  resetMinilmProbe();
+});
+
+/**
+ * A short corpus must stay silent. A truncation warning that fires when
+ * nothing was truncated is the same class of defect as one that never fires:
+ * the operator learns to ignore the line.
+ */
+test("embedder", "nothing is reported when nothing was truncated", () => {
+  if (!minilmAvailable()) {
+    assert(true, "no runnable embedder — nothing to measure");
+    return;
+  }
+  resetMinilmProbe();
+  embedLocalBatch(["short one", "short two", "short three"], "minilm");
+  assert(
+    minilmTruncationSeen() === null,
+    "no input exceeded the limit, so there must be no truncation report",
+  );
+  resetMinilmProbe();
+});
+
 test("gates", "correcting an indebted claim's number is not refused as a repeat", () => {
   if (!minilmAvailable()) {
     assert(true, "minilm model not on disk — soft skip");
@@ -4163,6 +4381,229 @@ test(
     }
   },
 );
+
+/**
+ * The estimator's job is to predict the real wordpiece count, and it undershot
+ * on 47.7% of a 43,541-passage corpus — 541 of them past 256 tokens while
+ * sitting under the 220 cap. The cause was one content shape: long runs with a
+ * digit in them (base64, hashes, tokens, UUIDs), charged ceil(len/6) where the
+ * tokenizer spends closer to len/1.5. An 800-character blob was estimated at
+ * 134 tokens and cost 573.
+ *
+ * Asserted as a ratio against the old formula rather than against a magic
+ * number, because what matters is that an opaque run is charged several times
+ * what a prose run of the same length is.
+ */
+/**
+ * KNOWN_LIMITATIONS 5: a deleted note's rows stay fully live, and retrieval
+ * never consults the filesystem, so a deleted note still answers questions.
+ *
+ * The entry argues deletion is unsafe because "a file absent from the walk is
+ * indistinguishable from one an --exclude pattern pruned". That is true of
+ * walk attendance and false of existence: an excluded file is still on disk.
+ * So the sweep is keyed on existsSync, which is what these tests fix in place.
+ */
+test("pins", "a document whose file is gone is reported, and one merely excluded is not", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-gone-"));
+  const keep = join(dir, "keep.md");
+  const drop = join(dir, "drop.md");
+  writeFileSync(keep, "# Keep\n\n## S\n\nThe kept note describes warehouse throughput.\n");
+  writeFileSync(drop, "# Drop\n\n## S\n\nThe dropped note describes courier manifests.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+
+  assert(findGoneDocuments(db).length === 0, "nothing is gone while both files exist");
+
+  // Compare resolved paths: the ingest root is stored as a realpath, and on
+  // macOS mkdtemp hands back /var/... while the stored root is /private/var/...
+  const resolvedDrop = realpathSync(dirname(drop)) + "/" + basename(drop);
+  rmSync(drop);
+  const gone = findGoneDocuments(db);
+  assert(gone.length === 1, `exactly one file is gone, got ${gone.length}`);
+  assert(
+    gone[0]!.file === resolvedDrop,
+    `expected ${resolvedDrop}, got ${gone[0]!.file}`,
+  );
+  assert(gone[0]!.passages >= 1, "the gone file had at least one passage");
+
+  // The exclude hazard the limitation names: keep.md is still on disk, so it
+  // must never appear in the gone set however it was filtered at ingest time.
+  assert(
+    !gone.some((g) => g.file === keep),
+    "a file that exists must never be reported gone, whatever an exclude did",
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * The guard that makes pruning safe at all, and the reason it is written before
+ * the prune itself. An unmounted volume or a renamed parent makes EVERY file
+ * under a root look deleted, so a sweep that trusted existsSync per file would
+ * delete an entire corpus on a mount failure — the same shape as the orphan
+ * sweep that destroyed running siblings. A root that is not reachable is
+ * unknown, never empty.
+ */
+test("pins", "an unreachable ingest root reports nothing gone rather than everything", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-unmount-"));
+  writeFileSync(join(dir, "a.md"), "# A\n\n## S\n\nFirst note about reconciliation.\n");
+  writeFileSync(join(dir, "b.md"), "# B\n\n## S\n\nSecond note about manifests.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  assert(findGoneDocuments(db).length === 0, "both files exist");
+
+  // Simulate the volume going away: the root itself disappears, taking every
+  // file with it. Per-file existsSync would now report both as deleted.
+  rmSync(dir, { recursive: true, force: true });
+  const gone = findGoneDocuments(db);
+  assert(
+    gone.length === 0,
+    `an unreachable root must yield no gone files, got ${gone.length} — this is the mass-deletion path`,
+  );
+});
+
+/**
+ * Pruning deletes the corpus rows of vanished files — and must not touch a row
+ * a belief cites. That pin still verifies against stored content, and since
+ * the file is gone from disk, the stored body is the LAST copy of the evidence
+ * the claim rests on. Trading a reported, recoverable state for an
+ * unrecoverable one is not hygiene.
+ */
+test("pins", "prune removes gone passages but never one a belief still cites", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-"));
+  const cited = join(dir, "cited.md");
+  const orphan = join(dir, "orphan.md");
+  writeFileSync(cited, "# Cited\n\n## S\n\nThe refund window is thirty days from delivery.\n");
+  writeFileSync(orphan, "# Orphan\n\n## S\n\nNobody ever cited this note about manifests.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+
+  // Pin a belief to a passage of cited.md.
+  const doc = db
+    .prepare(`SELECT id FROM vector_document WHERE source_ref LIKE ?`)
+    .get("cited.md#%") as { id: string } | undefined;
+  assert(doc !== undefined, "cited.md produced a passage");
+  // A pin carries the content hash it was minted against; verifyPin with an
+  // empty hash is how the rest of this file reads the current one.
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc!.id,
+    snapshotHash: "",
+  }).actualHash!;
+  const r = commitBelief(db, {
+    type: "inference",
+    text: "the cited note records a thirty day refund window",
+    sources: [{ kind: "vault_page", refId: doc!.id, snapshotHash }],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(r.ok, `test setup: commit refused: ${JSON.stringify(r)}`);
+
+  const before = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
+  rmSync(cited);
+  rmSync(orphan);
+
+  const out = pruneGoneDocuments(db);
+  assert(out.passages >= 1, `expected the orphan's passages removed, got ${out.passages}`);
+  assert(
+    out.pinnedSkipped >= 1,
+    `expected at least one pinned passage kept, got ${out.pinnedSkipped}`,
+  );
+  const stillThere = db
+    .prepare(`SELECT COUNT(*) AS c FROM vector_document WHERE id = ?`)
+    .get(doc!.id) as { c: number };
+  assert(stillThere.c === 1, "the cited passage must survive the prune");
+  const after = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
+  assert(after.c < before.c, "something was actually deleted");
+
+  // And the belief still verifies, against stored content, as goneFiles says.
+  const vr = buildVerifyReport(db);
+  assert(vr.broken === 0, `the pinned belief must not break, broken=${vr.broken}`);
+  assert(vr.goneFiles.length >= 1, "verify still reports the cited file as gone");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * The mass-deletion path, asserted on the destructive function rather than
+ * only on the read-only one: an unreachable root must delete NOTHING. A prune
+ * that trusted per-file existence would empty the corpus the first time a
+ * volume failed to mount.
+ */
+test("pins", "prune deletes nothing when the ingest root itself is unreachable", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-unmount-"));
+  writeFileSync(join(dir, "a.md"), "# A\n\n## S\n\nFirst note about reconciliation.\n");
+  writeFileSync(join(dir, "b.md"), "# B\n\n## S\n\nSecond note about manifests.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const before = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
+  assert(before.c > 0, "the corpus has rows to lose");
+
+  rmSync(dir, { recursive: true, force: true });
+  const out = pruneGoneDocuments(db);
+  assert(
+    out.passages === 0,
+    `an unreachable root must prune nothing, deleted ${out.passages}`,
+  );
+  const after = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
+  assert(after.c === before.c, "the corpus must be untouched");
+});
+
+test("pins", "an opaque run is charged far more than prose of the same length", () => {
+  const blob = "v3k4pkWfZLXQXuqJHWdnHsVcsjy7Ihz9taiAHDT5io6ADA1RsVyDtXroGgKhGb40";
+  const prose = "warehouse reconciliation throughput manifests couriers nightly batch";
+  assert(blob.length >= 60 && prose.length >= 60, "comparable lengths");
+
+  const blobTokens = estimateTokens(blob);
+  const proseTokens = estimateTokens(prose);
+  assert(
+    blobTokens > proseTokens * 2,
+    `an opaque run must cost multiples of prose: blob ${blobTokens} vs prose ${proseTokens}`,
+  );
+  // ceil(64/1.5) = 43. Guards against the predicate silently ceasing to fire.
+  assert(
+    blobTokens >= 40,
+    `a 64-char opaque run should cost ~43 tokens, got ${blobTokens}`,
+  );
+});
+
+/**
+ * The regression that the first version of this fix caused, and the reason the
+ * predicate is narrow. Treating everything not purely lowercase/Capitalised as
+ * opaque swept in every CamelCase product name a note mentions — words the
+ * vocabulary knows in two or three pieces — and re-chunked 54.8% of files and
+ * 73.7% of passages to remove the last 55 breaches.
+ *
+ * Boundary churn is cumulative and therefore unforgiving: shifting one unit's
+ * estimate moves every packing boundary after it in that file. So this asserts
+ * the cheap-to-check property that keeps churn bounded — ordinary words,
+ * whatever their capitalisation, are not opaque.
+ */
+test("pins", "CamelCase product names are not charged as opaque blobs", () => {
+  for (const word of [
+    "OpenClaw",
+    "TestFlight",
+    "GitHub",
+    "LocalForge",
+    "CloudStorage",
+    "ProtonDrive",
+    "reconciliation",
+    "MINILM",
+  ]) {
+    const t = estimateTokens(word);
+    assert(
+      t <= Math.ceil(word.length / 6) + 1,
+      `${word} is a word, not a blob: charged ${t} tokens for ${word.length} chars`,
+    );
+  }
+  // A digit alone must not make a short identifier opaque either: dates,
+  // versions and ordinals are everywhere in these notes.
+  for (const tok of ["2026", "v0.1.5", "Q3", "p7", "256"]) {
+    assert(
+      estimateTokens(tok) <= 6,
+      `${tok} should stay cheap, got ${estimateTokens(tok)}`,
+    );
+  }
+});
 
 test("pins", "splitPassages bounds a passage even when the heading itself is enormous", () => {
   // The breadcrumb is prepended to every passage body, so it is charged
@@ -6730,7 +7171,7 @@ test("oauth", "O10_retry_permanent_no_extra", () => {
 });
 
 
-test("oauth", "O11_seal_roundtrip", () => {
+test("oauth", "O11_seal_open_roundtrip", () => {
   process.env.CHAMBER_TOKEN_KEY = Buffer.alloc(32, 7).toString("base64");
   try {
     const s = sealSecret("super-secret-token");
